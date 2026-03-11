@@ -1,0 +1,409 @@
+use super::rotary_emb::ScalingRotaryEmbedding;
+use super::Config;
+use crate::backend::progress::{ProgressLike, ProgressReporter};
+use crate::openai::distributed::{
+    embedding, layer_norm, Comm, ReplicatedLinear, TensorParallelColumnLinear,
+    TensorParallelRowLinear, VarBuilder,
+};
+use crate::openai::models::mask::get_attention_causal_mask;
+use crate::{InputMetadata, PagedAttention};
+use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_nn::{Activation, Embedding, LayerNorm};
+use parking_lot::RwLock;
+use std::iter::zip;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+
+impl Phi2 {
+    pub fn load_config(filename: &PathBuf, isq: Option<String>) -> Result<Config> {
+        let mut config = Config::load_config(filename.clone())?;
+        config.head_dim = Some(
+            config
+                .head_dim
+                .unwrap_or(config.hidden_size / config.num_attention_heads),
+        );
+        config.num_key_value_heads = Some(
+            config
+                .num_key_value_heads
+                .unwrap_or(config.num_attention_heads),
+        );
+        config.max_seq_len = config.max_position_embeddings.unwrap_or(config.max_seq_len);
+        if config.quantization_config.is_some() {
+            config.quant = Some(
+                config
+                    .quantization_config
+                    .as_ref()
+                    .unwrap()
+                    .quant_method
+                    .clone(),
+            );
+        } else if isq.is_some() {
+            config.quant = Some(isq.unwrap().to_string());
+        }
+        Ok(config)
+    }
+}
+
+struct Mlp {
+    fc1: TensorParallelColumnLinear,
+    fc2: TensorParallelRowLinear,
+    act: Activation,
+}
+
+impl Mlp {
+    fn new(cfg: &Config, vb: VarBuilder, comm: Rc<Comm>) -> Result<Self> {
+        let fc1 = TensorParallelColumnLinear::load_with_hints(
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            false,
+            vb.pp("gate_proj"),
+            comm.clone(),
+            &cfg.quant,
+            &cfg.quantization_config,
+        )?;
+        let fc2 = TensorParallelRowLinear::load_with_hints(
+            cfg.intermediate_size,
+            cfg.hidden_size,
+            false,
+            vb.pp("down_proj"),
+            comm,
+            &cfg.quant,
+            &cfg.quantization_config,
+        )?;
+        Ok(Self {
+            fc1,
+            fc2,
+            // This does not match the mixformers implementation where Gelu is used rather than
+            // GeluNew.
+            act: cfg.hidden_act.unwrap_or(Activation::Silu),
+        })
+    }
+}
+
+impl Module for Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.fc2.forward(&self.act.forward(&self.fc1.forward(xs)?)?)
+    }
+}
+
+struct Attention {
+    q_proj: TensorParallelColumnLinear,
+    k_proj: TensorParallelColumnLinear,
+    v_proj: TensorParallelColumnLinear,
+    dense: TensorParallelRowLinear,
+    q_layernorm: Option<LayerNorm>,
+    k_layernorm: Option<LayerNorm>,
+    rotary_emb: Arc<ScalingRotaryEmbedding>,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    attn: PagedAttention,
+}
+
+impl Attention {
+    fn new(
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
+        cfg: &Config,
+        vb: VarBuilder,
+        comm: Rc<Comm>,
+    ) -> Result<Self> {
+        let num_heads = cfg.num_attention_heads;
+        let num_kv_heads = cfg.num_key_value_heads.unwrap();
+        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+
+        let q_proj = TensorParallelColumnLinear::load_with_hints(
+            cfg.hidden_size,
+            num_heads * head_dim,
+            false,
+            vb.pp("q_proj"),
+            comm.clone(),
+            &cfg.quant,
+            &cfg.quantization_config,
+        )?;
+        let k_proj = TensorParallelColumnLinear::load_with_hints(
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            false,
+            vb.pp("k_proj"),
+            comm.clone(),
+            &cfg.quant,
+            &cfg.quantization_config,
+        )?;
+        let v_proj = TensorParallelColumnLinear::load_with_hints(
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            false,
+            vb.pp("v_proj"),
+            comm.clone(),
+            &cfg.quant,
+            &cfg.quantization_config,
+        )?;
+
+        let dense = TensorParallelRowLinear::load_with_hints(
+            num_heads * head_dim,
+            cfg.hidden_size,
+            false,
+            vb.pp("o_proj"),
+            comm.clone(),
+            &cfg.quant,
+            &cfg.quantization_config,
+        )?;
+        let (q_layernorm, k_layernorm) = if cfg.qk_layernorm {
+            let q_layernorm = layer_norm(head_dim, cfg.rms_norm_eps, true, vb.pp("q_layernorm"))?;
+            let k_layernorm = layer_norm(head_dim, cfg.rms_norm_eps, true, vb.pp("k_layernorm"))?;
+            (Some(q_layernorm), Some(k_layernorm))
+        } else {
+            (None, None)
+        };
+        let attention_heads = cfg.num_attention_heads / comm.world_size();
+        let kv_heads = cfg.num_key_value_heads.unwrap() / comm.world_size();
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            dense,
+            q_layernorm,
+            k_layernorm,
+            rotary_emb: rotary_emb.clone(),
+            num_heads: attention_heads,
+            num_kv_heads: kv_heads,
+            head_dim,
+            attn: PagedAttention::new(
+                attention_heads,
+                head_dim,
+                1. / ((head_dim as f32).sqrt()),
+                Some(kv_heads),
+                cfg.sliding_window,
+                vb.device().clone(),
+                None,
+                cfg.fp8_kvcache.unwrap_or(false),
+            )?,
+        })
+    }
+
+    fn forward(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Vec<Tensor>>,
+        input_positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        let (seq_len, _n_embd) = xs.dims2()?;
+        let query_states = self.q_proj.forward(xs)?;
+        let key_states = self.k_proj.forward(xs)?;
+        let value_states = self.v_proj.forward(xs)?;
+
+        let query_states = match &self.q_layernorm {
+            None => query_states,
+            Some(ln) => query_states.apply(ln)?,
+        };
+        let key_states = match &self.k_layernorm {
+            None => key_states,
+            Some(ln) => key_states.apply(ln)?,
+        };
+
+        let q = query_states
+            .reshape((1, seq_len, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = key_states
+            .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = value_states
+            .reshape((1, seq_len, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let (q, k) = self.rotary_emb.apply_rotary_emb(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            input_positions,
+        )?;
+        let q = q.to_dtype(v.dtype())?;
+        let k = k.to_dtype(v.dtype())?;
+
+        let y = self
+            .attn
+            .forward(
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                cache.map(|(k_, _)| k_.clone()),
+                cache.map(|(_, v_)| v_.clone()),
+                input_metadata,
+                None,
+            )?
+            .reshape((seq_len, ()))?;
+
+        self.dense.forward(&y)
+    }
+}
+
+struct DecoderLayer {
+    self_attn: Attention,
+    mlp: Mlp,
+    input_layernorm: LayerNorm,
+}
+
+impl DecoderLayer {
+    fn new(
+        rotary_emb: Arc<ScalingRotaryEmbedding>,
+        cfg: &Config,
+        vb: VarBuilder,
+        comm: Rc<Comm>,
+    ) -> Result<Self> {
+        let self_attn = Attention::new(rotary_emb, cfg, vb.pp("self_attn"), comm.clone())?;
+        let mlp = Mlp::new(cfg, vb.pp("mlp"), comm.clone())?;
+        let input_layernorm = layer_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            true,
+            vb.pp("input_layernorm"),
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+        })
+    }
+
+    fn forward(
+        &self,
+        xs: &Tensor,
+        mask: Option<&Vec<Tensor>>,
+        input_positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = xs.apply(&self.input_layernorm)?;
+        let attn_outputs =
+            self.self_attn
+                .forward(&xs, mask, input_positions, cache, input_metadata)?;
+        let feed_forward_hidden_states = self.mlp.forward(&xs)?;
+        attn_outputs + feed_forward_hidden_states + residual
+    }
+}
+
+pub struct Phi2 {
+    embed_tokens: Embedding,
+    layers: Vec<DecoderLayer>,
+    final_layernorm: LayerNorm,
+    lm_head: ReplicatedLinear,
+    cfg: Config,
+    device: Device,
+    dtype: DType,
+}
+
+impl Phi2 {
+    pub fn new(
+        vb: VarBuilder,
+        cfg: &Config,
+        dtype: DType,
+        device: &Device,
+        comm: Rc<Comm>,
+        progress_reporter: Arc<RwLock<ProgressReporter>>,
+    ) -> Result<Self> {
+        let vb_m = vb.pp("model");
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let final_layernorm = layer_norm(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            true,
+            vb_m.pp("final_layernorm"),
+        )?;
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let vb_m = vb_m.pp("layers");
+        let reporter = progress_reporter.clone();
+        let rotary_emb = Arc::new(ScalingRotaryEmbedding::new(DType::F32, cfg, device, true)?);
+
+        for layer_idx in 0..cfg.num_hidden_layers {
+            let layer =
+                DecoderLayer::new(rotary_emb.clone(), cfg, vb_m.pp(layer_idx), comm.clone())?;
+            layers.push(layer);
+            reporter.write().set_progress(layer_idx + 1);
+        }
+        let lm_head = ReplicatedLinear::load_no_bias(
+            cfg.hidden_size,
+            cfg.vocab_size,
+            vb.pp("lm_head"),
+            &None,
+            &None,
+        )?;
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            final_layernorm,
+            lm_head,
+            cfg: cfg.clone(),
+            device: device.clone(),
+            dtype,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        input_positions: &Tensor,
+        kv_caches: Option<&Vec<(Tensor, Tensor)>>,
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        let seqlens = if input_metadata.cu_seqlens_q.is_some() {
+            input_metadata
+                .cu_seqlens_q
+                .as_ref()
+                .unwrap()
+                .to_vec1::<u32>()?[1..]
+                .into()
+        } else {
+            Vec::new()
+        };
+        let attention_mask = get_attention_causal_mask(
+            &self.device,
+            self.dtype,
+            input_positions,
+            &seqlens,
+            self.cfg.sliding_window,
+            input_metadata.is_prefill,
+        );
+        let mut xs = xs.apply(&self.embed_tokens)?;
+
+        if let Some(kv_caches) = kv_caches {
+            for ((k_cache, v_cache), layer) in zip(kv_caches.iter(), self.layers.iter()) {
+                xs = layer.forward(
+                    &xs,
+                    attention_mask.as_ref(),
+                    input_positions,
+                    Some((k_cache, v_cache)),
+                    input_metadata,
+                )?
+            }
+        } else {
+            for layer in self.layers.iter() {
+                xs = layer.forward(
+                    &xs,
+                    attention_mask.as_ref(),
+                    input_positions,
+                    None,
+                    input_metadata,
+                )?
+            }
+        }
+        if !seqlens.is_empty() {
+            let indices: Vec<_> = seqlens.iter().map(|x| x - 1 as u32).collect();
+            let batch = indices.len();
+            xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
+        }
+        let xs = self.final_layernorm.forward(&xs)?;
+        self.lm_head.forward(&xs)?.to_dtype(DType::F32)
+    }
+
+    pub fn get_config(&self) -> &Config {
+        &self.cfg
+    }
+}
